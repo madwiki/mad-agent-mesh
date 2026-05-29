@@ -64,6 +64,7 @@ SANDBOX_WORKSPACE_WRITE = "workspace-write"
 SANDBOX_DANGER_FULL_ACCESS = "danger-full-access"
 PROCESS_POLL_INTERVAL_S = 20
 PROCESS_IDLE_TIMEOUT_S = 600
+SHARED_WORKSPACE_SENTENCE = "The shared workspace for this workflow is `<repo>/.mad-agent-mesh/`."
 MAMS_CHANNELS_FILENAME = "mams_channels.json"
 LEGACY_SESSION_FILENAME = "codex_session.json"
 LEGACY_HISTORY_FILENAME = "codex_session_history.json"
@@ -1413,7 +1414,7 @@ def build_mams_reminder_text_for_channel(
     prompt_text: str,
 ) -> str:
     if full or tool == "init":
-        return prompt_text.strip()
+        return f"{SHARED_WORKSPACE_SENTENCE}\n\n{prompt_text.strip()}"
 
     brief_map = {
         "sync": (
@@ -1503,7 +1504,10 @@ def build_mams_reminder_text_for_invoker(tool: str, *, full: bool) -> str:
         "update-config": "Config update only. Full Mad Agent Mesh reminder still applies.",
         "dangerous-new-session": "Destructive continuity replacement. Full Mad Agent Mesh reminder still applies.",
     }
-    return (full_map if full else brief_map).get(tool, "")
+    selected = (full_map if full else brief_map).get(tool, "")
+    if full and selected:
+        return f"{SHARED_WORKSPACE_SENTENCE}\n\n{selected}"
+    return selected
 
 
 def collaborative_turn_index(tool: str, mams_channel: MamsChannelConfig) -> int:

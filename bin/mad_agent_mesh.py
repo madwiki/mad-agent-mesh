@@ -772,6 +772,8 @@ def apply_configure_payload(
                     extra_context=patch.get("extra_context"),
                     stage_guidance=merge_string_map({}, patch.get("stage_guidance") if isinstance(patch.get("stage_guidance"), dict) else None),
                     can_mutate=patch.get("can_mutate", True),
+                    runner=patch.get("runner", RUNNER_CODEX),
+                    runner_config=patch.get("runner_config"),
                     model=patch.get("model"),
                     reasoning_effort=patch.get("reasoning_effort"),
                 )
@@ -787,6 +789,8 @@ def apply_configure_payload(
                         patch.get("stage_guidance") if isinstance(patch.get("stage_guidance"), dict) else None,
                     ),
                     can_mutate=patch.get("can_mutate") if "can_mutate" in patch else existing.can_mutate,
+                    runner=patch.get("runner") if "runner" in patch else existing.runner,
+                    runner_config=patch.get("runner_config") if "runner_config" in patch else existing.runner_config,
                     session_id=existing.session_id,
                     model=patch.get("model") if "model" in patch else existing.model,
                     reasoning_effort=patch.get("reasoning_effort") if "reasoning_effort" in patch else existing.reasoning_effort,

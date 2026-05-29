@@ -509,6 +509,43 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertFalse(reviewer["can_mutate"])
         self.assertEqual(reviewer["model"], "gpt-review")
 
+    def test_configure_preserves_existing_runner_and_runner_config_when_not_overridden(self) -> None:
+        proc, _capture, state = self.run_skill(
+            "configure",
+            json.dumps(
+                {
+                    "mams_channels": [
+                        {
+                            "name": "claude-executor",
+                            "focus": "Keep execution aligned with the approved plan.",
+                            "model": "claude-sonnet",
+                            "reasoning_effort": "medium",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            initial_mams_channels=[
+                self.build_mams_channel(
+                    "claude-executor",
+                    runner="claude-code",
+                    runner_config={"permission_mode": "acceptEdits", "extra_args": ["--debug"]},
+                    can_mutate=True,
+                    session_id="claude-existing-session",
+                )
+            ],
+            mams_channel_name="claude-executor",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        executor = self.find_mams_channel(state, "claude-executor")
+        self.assertEqual(executor["runner"], "claude-code")
+        self.assertEqual(
+            executor["runner_config"],
+            {"permission_mode": "acceptEdits", "extra_args": ["--debug"]},
+        )
+        self.assertEqual(executor["model"], "claude-sonnet")
+        self.assertEqual(executor["reasoning_effort"], "medium")
+
     def test_prompt_includes_config_sections_and_ref_notice(self) -> None:
         proc, capture, _state = self.run_skill(
             "review-this-plan",

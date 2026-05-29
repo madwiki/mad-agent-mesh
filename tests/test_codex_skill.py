@@ -509,20 +509,6 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertFalse(reviewer["can_mutate"])
         self.assertEqual(reviewer["model"], "gpt-review")
 
-    def test_update_config_accepts_empty_stdin_and_creates_canonical_config(self) -> None:
-        proc, _capture, state = self.run_skill(
-            "update-config",
-            "",
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertTrue(state["mams_channels_exists"])
-        payload = state["mams_channels_payload"]
-        assert payload is not None
-        self.assertEqual(payload["version"], 5)
-        self.assertEqual(payload["mams_channels"], [])
-        self.assertIn("update-config applied.", proc.stdout)
-        self.assertIn("Created a canonical managed config because no prior managed config was present.", proc.stdout)
-
     def test_prompt_includes_config_sections_and_ref_notice(self) -> None:
         proc, capture, _state = self.run_skill(
             "review-this-plan",

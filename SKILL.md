@@ -94,7 +94,6 @@ Use only one command per current workflow need.
 | --- | --- |
 | Replace or switch the current managed session for a mams_channel after explicit user authorization | `dangerous-new-session.md` |
 | Patch mams_invoker guidance, shared stage guidance, or mams_channel metadata | `configure.md` |
-| Normalize existing managed state and rewrite the canonical config | `update-config.md` |
 | Bootstrap a new shared task or recover after compact/context clear | `init.md` |
 | Drive one or more mams_channel calls through one blocking wrapper call | `invoke.md` |
 | General discussion, coordination, disagreement handling, or review relay | `sync.md` |

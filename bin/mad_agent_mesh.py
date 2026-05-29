@@ -103,7 +103,6 @@ TOOL_HELP = {
     "execute-this-plan-part": "Execute one approved plan part on a mutate-capable managed channel (reads JSON from stdin).",
     "dangerous-new-session": "Explicitly authorize discarding continuity and starting or switching a managed MAMS mams_channel session (reads JSON from stdin).",
     "configure": "Patch mams_invoker guidance, shared guidance, or mams_channel metadata (reads JSON from stdin).",
-    "update-config": "Normalize discoverable managed state and rewrite the canonical config (does not read JSON from stdin).",
 }
 
 INVOKE_REQUESTS_FIELD = "requests"
@@ -865,11 +864,6 @@ class InvokePayload:
     requests: tuple[InvokeRequest, ...]
 
 
-def validate_update_config_input(stdin_text: str) -> None:
-    if stdin_text.replace("\r\n", "\n").replace("\r", "\n").strip():
-        raise ValueError("update-config does not accept input. Run it with empty stdin.")
-
-
 def parse_invoke_request_object(raw: object, *, index: int) -> InvokeRequest:
     if not isinstance(raw, dict):
         raise ValueError(f"invoke requests[{index}] must be a JSON object.")
@@ -1485,9 +1479,6 @@ def build_mams_reminder_text_for_invoker(tool: str, *, full: bool) -> str:
         "configure": (
             "This command applies a mams_invoker-supplied config patch. It does not mutate task files and it does not replace session continuity by itself."
         ),
-        "update-config": (
-            "This command normalizes managed state into the canonical Mad Agent Mesh config. It does not mutate task files and it does not replace session continuity by itself."
-        ),
         "dangerous-new-session": (
             "This command is for destructive continuity replacement. Use it only when the user explicitly authorizes abandoning or switching the managed session continuity."
         ),
@@ -1501,7 +1492,6 @@ def build_mams_reminder_text_for_invoker(tool: str, *, full: bool) -> str:
         "execute-this-plan": "Execute the approved plan as a substantial whole. Do not stop for trivial progress. Full Mad Agent Mesh reminder still applies, and the configured User Reminder still applies in full.",
         "execute-this-plan-part": "Execute only the approved plan part, and only use plan-part mode for genuinely large plans. The approved part must still be substantial. Full Mad Agent Mesh reminder still applies, and the configured User Reminder still applies in full.",
         "configure": "MAMS invoker-supplied config patch only. Full Mad Agent Mesh reminder still applies.",
-        "update-config": "Config update only. Full Mad Agent Mesh reminder still applies.",
         "dangerous-new-session": "Destructive continuity replacement. Full Mad Agent Mesh reminder still applies.",
     }
     selected = (full_map if full else brief_map).get(tool, "")
@@ -1519,7 +1509,7 @@ def collaborative_turn_index(tool: str, mams_channel: MamsChannelConfig) -> int:
 
 
 def should_use_full_reminder(tool: str, turn_index: int) -> bool:
-    if tool in {"init", "configure", "update-config", "dangerous-new-session"}:
+    if tool in {"init", "configure", "dangerous-new-session"}:
         return True
     if turn_index <= 0:
         return True
@@ -2125,7 +2115,7 @@ def is_mutating_command(command: str) -> bool:
 
 
 def command_requires_stdin(command: str) -> bool:
-    return command != "update-config"
+    return True
 
 
 def resolve_claude_permission_mode(
@@ -2919,7 +2909,7 @@ def main() -> int:
         raise RuntimeError("\n".join(lines))
 
     stdin_text = sys.stdin.read()
-    if args.cmd != "update-config" and not stdin_text.strip():
+    if not stdin_text.strip():
         eprint("Empty input. Provide content via stdin.")
         return 2
 
@@ -2961,45 +2951,6 @@ def main() -> int:
                 repo_root,
                 updated_config,
                 tool="configure",
-                full_reminder=True,
-                reply="\n".join(lines),
-                migration_notice=migration_notice,
-            )
-        )
-        return 0
-
-    if args.cmd == "update-config":
-        try:
-            validate_update_config_input(stdin_text)
-            repo_root.mkdir(parents=True, exist_ok=True)
-            (repo_root / MANAGED_DIRNAME).mkdir(parents=True, exist_ok=True)
-            config, migration_notice, created_canonical = resolve_config_for_update(
-                repo_root,
-                default_model=effective_default_model,
-                default_reasoning_effort=effective_default_reasoning_effort,
-            )
-        except Exception as exc:
-            eprint(str(exc))
-            return 1
-
-        mams_channel_names = ", ".join(mams_channel.name for mams_channel in config.mams_channels) if config.mams_channels else "(none)"
-        if created_canonical:
-            status_line = "Created a canonical managed config because no prior managed config was present."
-        elif migration_notice:
-            status_line = "Normalized existing managed state into the canonical config."
-        else:
-            status_line = "Canonical managed config is already up to date."
-        lines = [
-            "update-config applied.",
-            status_line,
-            f"Config path: {mams_channels_file_path(repo_root)}",
-            f"Managed mams_channels: {mams_channel_names}",
-        ]
-        sys.stdout.write(
-            format_output_for_mams_invoker(
-                repo_root,
-                config,
-                tool="update-config",
                 full_reminder=True,
                 reply="\n".join(lines),
                 migration_notice=migration_notice,

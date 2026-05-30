@@ -62,16 +62,11 @@ SYNC_PLAN_TITLE = "Plan"
 SANDBOX_READ_ONLY = "read-only"
 SANDBOX_WORKSPACE_WRITE = "workspace-write"
 SANDBOX_DANGER_FULL_ACCESS = "danger-full-access"
-CLAUDE_READ_ONLY_ALLOWED_TOOLS = [
-    "Bash(git *)",
-    "Bash(rg *)",
-    "Bash(ls *)",
-    "Bash(cat *)",
-    "Bash(find *)",
-    "Bash(head *)",
-    "Bash(tail *)",
-    "Bash(grep *)",
-    "Bash(sed -n *)",
+CLAUDE_READ_ONLY_DISALLOWED_TOOLS = [
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "NotebookEdit",
 ]
 PROCESS_POLL_INTERVAL_S = 20
 PROCESS_IDLE_TIMEOUT_S = 600
@@ -1925,7 +1920,15 @@ def build_execute_prompt(
     )
 
 
-def resolve_execution_sandbox(cmd: str, stdin_text: str) -> str:
+def resolve_execution_sandbox(
+    cmd: str,
+    stdin_text: str,
+    mams_channel: MamsChannelConfig,
+) -> str:
+    if cmd == "sync":
+        if mams_channel.can_mutate:
+            return SANDBOX_WORKSPACE_WRITE
+        return SANDBOX_READ_ONLY
     if cmd in {"execute-this-plan", "execute-this-plan-part"}:
         payload = parse_execute_payload(stdin_text, mode=cmd)
         if payload.sandbox_mode == EXECUTE_SANDBOX_FULL_ACCESS:
@@ -2144,20 +2147,20 @@ def resolve_claude_permission_mode(
         return "bypassPermissions"
     if sandbox_mode == SANDBOX_WORKSPACE_WRITE:
         return "acceptEdits"
-    return "default"
+    return "bypassPermissions"
 
 
-def resolve_claude_allowed_tools(
+def resolve_claude_disallowed_tools(
     sandbox_mode: str,
     runner_config: dict[str, object],
 ) -> Optional[list[str]]:
-    raw = runner_config.get("allowed_tools")
+    raw = runner_config.get("disallowed_tools")
     if raw is not None:
         if not isinstance(raw, list) or not all(isinstance(item, str) and item.strip() for item in raw):
-            raise ValueError("runner_config.allowed_tools must be a JSON array of non-empty strings when provided.")
+            raise ValueError("runner_config.disallowed_tools must be a JSON array of non-empty strings when provided.")
         return [item.strip() for item in raw]
     if sandbox_mode == SANDBOX_READ_ONLY:
-        return list(CLAUDE_READ_ONLY_ALLOWED_TOOLS)
+        return list(CLAUDE_READ_ONLY_DISALLOWED_TOOLS)
     return None
 
 
@@ -2294,7 +2297,7 @@ def execute_command_for_mams_channel(
                 stdin_text,
                 full_reminder=full_reminder,
             )
-        sandbox_mode = resolve_execution_sandbox(command, stdin_text)
+        sandbox_mode = resolve_execution_sandbox(command, stdin_text, mams_channel)
         result = run_runner_for_mams_channel(
             repo_root=repo_root,
             mams_channel=mams_channel,
@@ -2527,7 +2530,10 @@ def run_invoke_command(
                 updated_mams_channel=None,
             )
 
-    use_parallel = len(prepared) > 1 and all(not is_mutating_command(item[0].command) for item in prepared)
+    use_parallel = len(prepared) > 1 and all(
+        resolve_execution_sandbox(item[0].command, item[0].stdin_text, item[1]) == SANDBOX_READ_ONLY
+        for item in prepared
+    )
     if use_parallel:
         with ThreadPoolExecutor(max_workers=len(prepared)) as executor:
             settled = list(executor.map(perform, prepared))
@@ -2670,7 +2676,7 @@ def run_claude_code(
     tmp_stream = Path(tempfile.mkstemp(prefix="mad-agent-mesh-claude-stream-", suffix=".jsonl")[1])
     try:
         permission_mode = resolve_claude_permission_mode(sandbox_mode, runner_config)
-        allowed_tools = resolve_claude_allowed_tools(sandbox_mode, runner_config)
+        disallowed_tools = resolve_claude_disallowed_tools(sandbox_mode, runner_config)
         extra_args = resolve_runner_extra_args(runner_config)
         cmd = [
             CLAUDE_BIN,
@@ -2681,8 +2687,8 @@ def run_claude_code(
             "--permission-mode",
             permission_mode,
         ]
-        if allowed_tools:
-            cmd += ["--allowedTools", ",".join(allowed_tools)]
+        if disallowed_tools:
+            cmd += ["--disallowedTools", ",".join(disallowed_tools)]
         if model:
             cmd += ["--model", model]
         if reasoning_effort:

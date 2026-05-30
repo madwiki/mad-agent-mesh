@@ -744,7 +744,7 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertEqual(reviewer["reasoning_effort"], "medium")
         self.assertEqual(reviewer["previous_session_ids"], ["current-session", "older-session"])
 
-    def test_sync_uses_read_only_and_accepts_markdown_sections(self) -> None:
+    def test_sync_uses_workspace_write_for_mutate_capable_channel_and_accepts_markdown_sections(self) -> None:
         proc, capture, _state = self.run_skill(
             "sync",
             '{"sync_message":"Please respond to the current review feedback."}',
@@ -753,7 +753,7 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         assert capture is not None
-        self.assertEqual(self.sandbox_from_argv(capture["argv"]), "read-only")
+        self.assertEqual(self.sandbox_from_argv(capture["argv"]), "workspace-write")
         self.assertIn("<<<SYNC_MESSAGE.BEGIN>>>", capture["stdin"])
         self.assertIn("Sync message from the mams_invoker:", capture["stdin"])
         self.assertIn("## Plan", proc.stdout)
@@ -806,10 +806,10 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertEqual(capture["runner"], "claude-code")
         self.assertIn("--permission-mode", capture["argv"])
         permission_mode = capture["argv"][capture["argv"].index("--permission-mode") + 1]
-        self.assertEqual(permission_mode, "default")
-        self.assertIn("--allowedTools", capture["argv"])
-        allowed_tools = capture["argv"][capture["argv"].index("--allowedTools") + 1]
-        self.assertIn("Bash(git *)", allowed_tools)
+        self.assertEqual(permission_mode, "bypassPermissions")
+        self.assertIn("--disallowedTools", capture["argv"])
+        disallowed_tools = capture["argv"][capture["argv"].index("--disallowedTools") + 1]
+        self.assertIn("Edit", disallowed_tools)
         self.assertNotIn("--resume", capture["argv"])
         planner = self.find_mams_channel(state, "planner")
         self.assertEqual(planner["session_id"], "claude-session")
@@ -834,8 +834,8 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         assert capture is not None
         self.assertEqual(capture["runner"], "claude-code")
         permission_mode = capture["argv"][capture["argv"].index("--permission-mode") + 1]
-        self.assertEqual(permission_mode, "default")
-        self.assertIn("--allowedTools", capture["argv"])
+        self.assertEqual(permission_mode, "bypassPermissions")
+        self.assertIn("--disallowedTools", capture["argv"])
         self.assertIn("--resume", capture["argv"])
         self.assertIn("claude-existing-session", capture["argv"])
 

@@ -2132,6 +2132,16 @@ def looks_like_missing_thread_error(message: str) -> bool:
     return False
 
 
+def format_rate_limit_reset_hint(resets_at: object) -> Optional[str]:
+    if not isinstance(resets_at, (int, float)):
+        return None
+    try:
+        dt = datetime.fromtimestamp(float(resets_at), tz=timezone.utc).astimezone()
+    except Exception:
+        return None
+    return f"Rate limit resets at {dt.strftime('%Y-%m-%d %H:%M:%S %z')}."
+
+
 def is_mutating_command(command: str) -> bool:
     return command in INVOKE_MUTATING_COMMANDS
 
@@ -2714,6 +2724,7 @@ def run_claude_code(
         detected_session_id: Optional[str] = None
         final_reply: Optional[str] = None
         result_errors: list[str] = []
+        rate_limit_reset_hint: Optional[str] = None
         stderr_lines: list[str] = []
 
         try:
@@ -2725,7 +2736,7 @@ def run_claude_code(
             raise
 
         def drain_stdout(line: str) -> None:
-            nonlocal detected_session_id, final_reply
+            nonlocal detected_session_id, final_reply, rate_limit_reset_hint
             with tmp_stream.open("a", encoding="utf-8") as handle:
                 handle.write(line)
 
@@ -2748,6 +2759,8 @@ def run_claude_code(
                 result_text = event.get("result")
                 if isinstance(result_text, str):
                     final_reply = result_text.strip()
+                    if event.get("is_error") and result_text.strip():
+                        result_errors.append(result_text.strip())
                 raw_errors = event.get("errors")
                 if isinstance(raw_errors, list):
                     for item in raw_errors:
@@ -2756,6 +2769,12 @@ def run_claude_code(
                 raw_session_id = event.get("session_id")
                 if isinstance(raw_session_id, str) and raw_session_id:
                     detected_session_id = raw_session_id
+            if event.get("type") == "rate_limit_event":
+                rate_limit_info = event.get("rate_limit_info")
+                if isinstance(rate_limit_info, dict):
+                    hint = format_rate_limit_reset_hint(rate_limit_info.get("resetsAt"))
+                    if hint:
+                        rate_limit_reset_hint = hint
 
         def drain_stderr(line: str) -> None:
             if line:
@@ -2775,7 +2794,10 @@ def run_claude_code(
         if rc != 0:
             stderr = "\n".join(line for line in stderr_lines if line).strip()
             stdout_error = "\n".join(item for item in result_errors if item).strip()
-            raise RuntimeError(stdout_error or stderr or f"claude-code exited with code {rc}")
+            base_error = stdout_error or stderr or f"claude-code exited with code {rc}"
+            if rate_limit_reset_hint and rate_limit_reset_hint not in base_error:
+                base_error = f"{base_error}\n{rate_limit_reset_hint}"
+            raise RuntimeError(base_error)
 
         if not detected_session_id:
             raise RuntimeError("Failed to detect Claude Code session_id from stream-json output.")

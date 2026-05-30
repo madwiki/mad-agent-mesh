@@ -99,6 +99,7 @@ FAKE_CLAUDE_SOURCE = textwrap.dedent(
     reply = os.environ["FAKE_CHANNEL_REPLY"]
     forced_error = os.environ.get("FAKE_CODEX_ERROR")
     stdout_error = os.environ.get("FAKE_CLAUDE_STDOUT_ERROR")
+    rate_limit_resets_at = os.environ.get("FAKE_CLAUDE_RATE_LIMIT_RESETS_AT")
     reply_map = json.loads(os.environ.get("FAKE_CHANNEL_REPLY_MAP", "{}"))
     error_map = json.loads(os.environ.get("FAKE_CODEX_ERROR_MAP", "{}"))
     session_map = json.loads(os.environ.get("FAKE_CODEX_SESSION_MAP", "{}"))
@@ -125,6 +126,9 @@ FAKE_CLAUDE_SOURCE = textwrap.dedent(
     if forced_error:
         print(forced_error, file=sys.stderr)
         sys.exit(1)
+
+    if rate_limit_resets_at:
+        print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {"resetsAt": float(rate_limit_resets_at)}}), flush=True)
 
     if stdout_error:
         print(json.dumps({"type": "result", "session_id": "claude-session", "errors": [stdout_error]}), flush=True)
@@ -1076,6 +1080,21 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertIn("could not resume", proc.stderr)
         self.assertIn("dangerous-new-session", proc.stderr)
         self.assertIn("managed mams_channel 'planner'", proc.stderr)
+
+    def test_claude_rate_limit_error_surfaces_reset_time(self) -> None:
+        proc, _capture, _state = self.run_skill(
+            "review-this-work",
+            '{"work_for_review":"Please review the completed work."}',
+            initial_mams_channels=[self.build_mams_channel("planner", runner="claude-code", session_id="rate-limited-session")],
+            mams_channel_name="planner",
+            env_extra={
+                "FAKE_CLAUDE_STDOUT_ERROR": "You've hit your session limit · resets 9:40am (Asia/Shanghai)",
+                "FAKE_CLAUDE_RATE_LIMIT_RESETS_AT": "1780105200",
+            },
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("You've hit your session limit", proc.stderr)
+        self.assertIn("Rate limit resets at", proc.stderr)
 
     def test_review_this_plan_rejects_legacy_json_reply(self) -> None:
         proc, _capture, _state = self.run_skill(

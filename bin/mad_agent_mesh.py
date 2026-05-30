@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 from concurrent.futures import ThreadPoolExecutor
+import argparse
 import json
 import os
 import re
@@ -62,6 +62,17 @@ SYNC_PLAN_TITLE = "Plan"
 SANDBOX_READ_ONLY = "read-only"
 SANDBOX_WORKSPACE_WRITE = "workspace-write"
 SANDBOX_DANGER_FULL_ACCESS = "danger-full-access"
+CLAUDE_READ_ONLY_ALLOWED_TOOLS = [
+    "Bash(git *)",
+    "Bash(rg *)",
+    "Bash(ls *)",
+    "Bash(cat *)",
+    "Bash(find *)",
+    "Bash(head *)",
+    "Bash(tail *)",
+    "Bash(grep *)",
+    "Bash(sed -n *)",
+]
 PROCESS_POLL_INTERVAL_S = 20
 PROCESS_IDLE_TIMEOUT_S = 600
 SHARED_WORKSPACE_SENTENCE = "The shared workspace for this workflow is `<repo>/.mad-agent-mesh/`."
@@ -2133,7 +2144,21 @@ def resolve_claude_permission_mode(
         return "bypassPermissions"
     if sandbox_mode == SANDBOX_WORKSPACE_WRITE:
         return "acceptEdits"
-    return "plan"
+    return "default"
+
+
+def resolve_claude_allowed_tools(
+    sandbox_mode: str,
+    runner_config: dict[str, object],
+) -> Optional[list[str]]:
+    raw = runner_config.get("allowed_tools")
+    if raw is not None:
+        if not isinstance(raw, list) or not all(isinstance(item, str) and item.strip() for item in raw):
+            raise ValueError("runner_config.allowed_tools must be a JSON array of non-empty strings when provided.")
+        return [item.strip() for item in raw]
+    if sandbox_mode == SANDBOX_READ_ONLY:
+        return list(CLAUDE_READ_ONLY_ALLOWED_TOOLS)
+    return None
 
 
 def resolve_runner_extra_args(runner_config: dict[str, object]) -> list[str]:
@@ -2645,6 +2670,7 @@ def run_claude_code(
     tmp_stream = Path(tempfile.mkstemp(prefix="mad-agent-mesh-claude-stream-", suffix=".jsonl")[1])
     try:
         permission_mode = resolve_claude_permission_mode(sandbox_mode, runner_config)
+        allowed_tools = resolve_claude_allowed_tools(sandbox_mode, runner_config)
         extra_args = resolve_runner_extra_args(runner_config)
         cmd = [
             CLAUDE_BIN,
@@ -2655,6 +2681,8 @@ def run_claude_code(
             "--permission-mode",
             permission_mode,
         ]
+        if allowed_tools:
+            cmd += ["--allowedTools", ",".join(allowed_tools)]
         if model:
             cmd += ["--model", model]
         if reasoning_effort:

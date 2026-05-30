@@ -312,7 +312,11 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
 
             capture = None
             if capture_path.exists():
-                capture = json.loads(capture_path.read_text(encoding="utf-8"))
+                raw_capture = capture_path.read_text(encoding="utf-8")
+                try:
+                    capture = json.loads(raw_capture)
+                except json.JSONDecodeError:
+                    capture = None
 
             agents_path = managed_dir / CHANNELS_FILENAME
             state = {
@@ -787,7 +791,7 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         )
         self.assertIn("Approved plan part from the mams_invoker:", capture["stdin"])
 
-    def test_claude_code_runner_creates_session_and_uses_plan_permission_for_review(self) -> None:
+    def test_claude_code_runner_creates_session_and_allows_read_only_bash_for_review(self) -> None:
         proc, capture, state = self.run_skill(
             "review-this-plan",
             '{"plan_for_review":"Review the current plan."}',
@@ -802,7 +806,10 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertEqual(capture["runner"], "claude-code")
         self.assertIn("--permission-mode", capture["argv"])
         permission_mode = capture["argv"][capture["argv"].index("--permission-mode") + 1]
-        self.assertEqual(permission_mode, "plan")
+        self.assertEqual(permission_mode, "default")
+        self.assertIn("--allowedTools", capture["argv"])
+        allowed_tools = capture["argv"][capture["argv"].index("--allowedTools") + 1]
+        self.assertIn("Bash(git *)", allowed_tools)
         self.assertNotIn("--resume", capture["argv"])
         planner = self.find_mams_channel(state, "planner")
         self.assertEqual(planner["session_id"], "claude-session")
@@ -826,6 +833,9 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         assert capture is not None
         self.assertEqual(capture["runner"], "claude-code")
+        permission_mode = capture["argv"][capture["argv"].index("--permission-mode") + 1]
+        self.assertEqual(permission_mode, "default")
+        self.assertIn("--allowedTools", capture["argv"])
         self.assertIn("--resume", capture["argv"])
         self.assertIn("claude-existing-session", capture["argv"])
 

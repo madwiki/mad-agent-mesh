@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from typing import Optional, Tuple
@@ -12,6 +13,7 @@ from typing import Optional, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin" / "mad_agent_mesh.py"
 CHANNELS_FILENAME = "mams_channels.json"
+ACTIVE_RUNS_DIRNAME = "active-runs"
 LEGACY_SESSION_FILENAME = "codex_session.json"
 LEGACY_HISTORY_FILENAME = "codex_session_history.json"
 MANAGED_DIRNAME = ".mad-agent-mesh"
@@ -337,6 +339,50 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
                 "legacy_history_exists": (legacy_dir / LEGACY_HISTORY_FILENAME).exists(),
             }
             return proc, capture, state
+
+    def create_test_runtime(
+        self,
+        *,
+        initial_mams_channels: list[dict],
+        env_extra: Optional[dict[str, str]] = None,
+    ) -> tuple[tempfile.TemporaryDirectory[str], Path, dict[str, str], Path]:
+        tempdir = tempfile.TemporaryDirectory()
+        tmp = Path(tempdir.name)
+        workspace = tmp / "workspace"
+        managed_dir = workspace / MANAGED_DIRNAME
+        legacy_dir = workspace / LEGACY_DIRNAME
+        managed_dir.mkdir(parents=True)
+        legacy_dir.mkdir(parents=True)
+        (managed_dir / "refs").mkdir(parents=True, exist_ok=True)
+        (managed_dir / CHANNELS_FILENAME).write_text(
+            json.dumps(self.build_config(initial_mams_channels), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        fake_codex = tmp / "fake-codex.py"
+        fake_codex.write_text(FAKE_CODEX_SOURCE, encoding="utf-8")
+        fake_codex.chmod(0o755)
+        fake_claude = tmp / "fake-claude.py"
+        fake_claude.write_text(FAKE_CLAUDE_SOURCE, encoding="utf-8")
+        fake_claude.chmod(0o755)
+
+        env = os.environ.copy()
+        env["CODEX_BIN"] = str(fake_codex)
+        env["CLAUDE_BIN"] = str(fake_claude)
+        env["CODEX_HOME"] = str(tmp / "codex-home")
+        env["FAKE_CHANNEL_REPLY"] = "approved_to_mutate: true\n\n## Plan Review Reply\n\nLooks fine."
+        if env_extra:
+            env.update(env_extra)
+        return tempdir, workspace, env, managed_dir
+
+    @staticmethod
+    def wait_for_path(path: Path, *, timeout_s: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if path.exists():
+                return True
+            time.sleep(0.05)
+        return path.exists()
 
     @staticmethod
     def sandbox_from_argv(argv: list[str]) -> str:
@@ -766,6 +812,95 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertIn("<<<SYNC_MESSAGE.BEGIN>>>", capture["stdin"])
         self.assertIn("Sync message from the mams_invoker:", capture["stdin"])
         self.assertIn("## Plan", proc.stdout)
+
+    def test_interrupt_stops_direct_channel_turn(self) -> None:
+        tempdir, workspace, env, managed_dir = self.create_test_runtime(
+            initial_mams_channels=[self.build_mams_channel("planner", can_mutate=False)],
+            env_extra={
+                "FAKE_CODEX_SLEEP_S": "30",
+                "FAKE_CHANNEL_REPLY": "## Discussion Reply\n\nStill working.",
+            },
+        )
+        with tempdir:
+            proc = subprocess.Popen(
+                [sys.executable, str(SCRIPT), "--cwd", str(workspace), "--mams-channel", "planner", "sync"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=str(ROOT),
+            )
+            assert proc.stdin is not None
+            proc.stdin.write('{"sync_message":"Investigate and continue until interrupted."}')
+            proc.stdin.close()
+            proc.stdin = None
+
+            active_run_path = managed_dir / ACTIVE_RUNS_DIRNAME / "planner.json"
+            self.assertTrue(self.wait_for_path(active_run_path), "active run record was not created in time")
+
+            interrupt = subprocess.run(
+                [sys.executable, str(SCRIPT), "--cwd", str(workspace), "--mams-channel", "planner", "interrupt"],
+                input='{"reason":"Direction is invalid."}',
+                text=True,
+                capture_output=True,
+                env=env,
+                cwd=str(ROOT),
+            )
+            self.assertEqual(interrupt.returncode, 0, interrupt.stderr)
+            self.assertIn("Interrupt sent to mams_channel 'planner'.", interrupt.stdout)
+
+            stdout, stderr = proc.communicate(timeout=10)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("was interrupted by an explicit interrupt command", stderr)
+            self.assertIn("Interrupt reason: Direction is invalid.", stderr)
+            self.assertFalse(active_run_path.exists(), "active run record should be cleared after interruption")
+
+    def test_interrupt_marks_invoke_result_as_interrupted_error(self) -> None:
+        tempdir, workspace, env, managed_dir = self.create_test_runtime(
+            initial_mams_channels=[self.build_mams_channel("planner", can_mutate=False)],
+            env_extra={
+                "FAKE_CODEX_SLEEP_S": "30",
+                "FAKE_CHANNEL_REPLY": "approved_to_mutate: true\n\n## Plan Review Reply\n\nLooks fine.",
+            },
+        )
+        with tempdir:
+            proc = subprocess.Popen(
+                [sys.executable, str(SCRIPT), "--cwd", str(workspace), "--mams-channel", "planner", "invoke"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=str(ROOT),
+            )
+            assert proc.stdin is not None
+            proc.stdin.write(
+                '{"command":"review-this-plan","input":{"plan_for_review":"Large plan under review."}}'
+            )
+            proc.stdin.close()
+            proc.stdin = None
+
+            active_run_path = managed_dir / ACTIVE_RUNS_DIRNAME / "planner.json"
+            self.assertTrue(self.wait_for_path(active_run_path), "active run record was not created in time")
+
+            interrupt = subprocess.run(
+                [sys.executable, str(SCRIPT), "--cwd", str(workspace), "--mams-channel", "planner", "interrupt"],
+                input='{"reason":"The underlying assumption is wrong."}',
+                text=True,
+                capture_output=True,
+                env=env,
+                cwd=str(ROOT),
+            )
+            self.assertEqual(interrupt.returncode, 0, interrupt.stderr)
+            self.assertIn("Interrupt sent to mams_channel 'planner'.", interrupt.stdout)
+
+            stdout, stderr = proc.communicate(timeout=10)
+            self.assertEqual(proc.returncode, 0, stderr)
+            self.assertIn("planner · review-this-plan · error", stdout)
+            self.assertIn("was interrupted by an explicit interrupt command", stdout)
+            self.assertIn("Interrupt reason: The underlying assumption is wrong.", stdout)
+            self.assertFalse(active_run_path.exists(), "active run record should be cleared after interruption")
 
     def test_execute_this_plan_defaults_to_workspace_write(self) -> None:
         proc, capture, _state = self.run_skill(

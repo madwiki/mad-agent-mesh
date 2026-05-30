@@ -3,9 +3,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import argparse
+import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,6 +17,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Tuple
+from uuid import uuid4
 
 
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
@@ -70,8 +73,10 @@ CLAUDE_READ_ONLY_DISALLOWED_TOOLS = [
 ]
 PROCESS_POLL_INTERVAL_S = 20
 PROCESS_IDLE_TIMEOUT_S = 600
+INTERRUPT_GRACE_PERIOD_S = 3.0
 SHARED_WORKSPACE_SENTENCE = "The shared workspace for this workflow is `<repo>/.mad-agent-mesh/`."
 MAMS_CHANNELS_FILENAME = "mams_channels.json"
+ACTIVE_RUNS_DIRNAME = "active-runs"
 LEGACY_SESSION_FILENAME = "codex_session.json"
 LEGACY_HISTORY_FILENAME = "codex_session_history.json"
 MANAGED_DIRNAME = ".mad-agent-mesh"
@@ -107,6 +112,7 @@ TOOL_HELP = {
     "review-this-work": "Review submitted work on the targeted managed channel without mutating state (reads JSON from stdin).",
     "execute-this-plan": "Execute one approved plan on a mutate-capable managed channel (reads JSON from stdin).",
     "execute-this-plan-part": "Execute one approved plan part on a mutate-capable managed channel (reads JSON from stdin).",
+    "interrupt": "Interrupt the currently active runner process for the selected managed channel (reads optional JSON from stdin).",
     "dangerous-new-session": "Explicitly authorize discarding continuity and starting or switching a managed MAMS mams_channel session (reads JSON from stdin).",
     "configure": "Patch mams_invoker guidance, shared guidance, or mams_channel metadata (reads JSON from stdin).",
 }
@@ -196,6 +202,22 @@ def mams_channels_file_path(repo_root: Path) -> Path:
     return repo_root / MANAGED_DIRNAME / MAMS_CHANNELS_FILENAME
 
 
+def active_runs_dir(repo_root: Path) -> Path:
+    return repo_root / MANAGED_DIRNAME / ACTIVE_RUNS_DIRNAME
+
+
+def safe_channel_filename(name: str) -> str:
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-") or "channel"
+    if base == name:
+        return base
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{base}-{digest}"
+
+
+def active_run_record_path(repo_root: Path, mams_channel_name: str) -> Path:
+    return active_runs_dir(repo_root) / f"{safe_channel_filename(mams_channel_name)}.json"
+
+
 def iter_legacy_structured_config_paths(repo_root: Path) -> Iterator[Path]:
     for filename in LEGACY_STRUCTURED_FILENAMES:
         managed_path = repo_root / MANAGED_DIRNAME / filename
@@ -210,6 +232,175 @@ def legacy_session_file_path(repo_root: Path) -> Path:
 
 def legacy_session_history_file_path(repo_root: Path) -> Path:
     return repo_root / LEGACY_MANAGED_DIRNAME / LEGACY_HISTORY_FILENAME
+
+
+def active_run_record_to_json(record: ActiveRunRecord) -> dict[str, object]:
+    return {
+        "run_id": record.run_id,
+        "mams_channel_name": record.mams_channel_name,
+        "runner": record.runner,
+        "command": record.command,
+        "wrapper_pid": record.wrapper_pid,
+        "runner_pid": record.runner_pid,
+        "started_at": record.started_at,
+        "interrupt_requested_at": record.interrupt_requested_at,
+        "interrupt_reason": record.interrupt_reason,
+    }
+
+
+def parse_active_run_record(raw: object, *, path: Path) -> ActiveRunRecord:
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Active run record must be a JSON object: {path}")
+    run_id = normalize_optional_string(raw.get("run_id"))
+    mams_channel_name = normalize_optional_string(raw.get("mams_channel_name"))
+    runner = normalize_optional_string(raw.get("runner"))
+    command = normalize_optional_string(raw.get("command"))
+    started_at = normalize_optional_string(raw.get("started_at"))
+    wrapper_pid = raw.get("wrapper_pid")
+    runner_pid = raw.get("runner_pid")
+    if not run_id or not mams_channel_name or not runner or not command or not started_at:
+        raise RuntimeError(f"Active run record is missing required string fields: {path}")
+    if not isinstance(wrapper_pid, int) or wrapper_pid <= 0:
+        raise RuntimeError(f"Active run record has invalid wrapper_pid: {path}")
+    if not isinstance(runner_pid, int) or runner_pid <= 0:
+        raise RuntimeError(f"Active run record has invalid runner_pid: {path}")
+    interrupt_requested_at = normalize_optional_string(raw.get("interrupt_requested_at"))
+    interrupt_reason = normalize_optional_string(raw.get("interrupt_reason"))
+    return ActiveRunRecord(
+        run_id=run_id,
+        mams_channel_name=mams_channel_name,
+        runner=runner,
+        command=command,
+        wrapper_pid=wrapper_pid,
+        runner_pid=runner_pid,
+        started_at=started_at,
+        interrupt_requested_at=interrupt_requested_at,
+        interrupt_reason=interrupt_reason,
+    )
+
+
+def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_active_run_record(repo_root: Path, mams_channel_name: str) -> Optional[ActiveRunRecord]:
+    path = active_run_record_path(repo_root, mams_channel_name)
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid active run record JSON in {path}: {exc.msg}") from exc
+    return parse_active_run_record(raw, path=path)
+
+
+def write_active_run_record(repo_root: Path, record: ActiveRunRecord) -> None:
+    write_json_atomic(active_run_record_path(repo_root, record.mams_channel_name), active_run_record_to_json(record))
+
+
+def clear_active_run_record(repo_root: Path, mams_channel_name: str, *, run_id: Optional[str] = None) -> None:
+    path = active_run_record_path(repo_root, mams_channel_name)
+    if not path.exists():
+        return
+    if run_id is not None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            current = parse_active_run_record(raw, path=path)
+        except Exception:
+            return
+        if current.run_id != run_id:
+            return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def register_active_run(
+    repo_root: Path,
+    *,
+    mams_channel_name: str,
+    runner: str,
+    command: str,
+    runner_pid: int,
+) -> ActiveRunRecord:
+    record = ActiveRunRecord(
+        run_id=str(uuid4()),
+        mams_channel_name=mams_channel_name,
+        runner=runner,
+        command=command,
+        wrapper_pid=os.getpid(),
+        runner_pid=runner_pid,
+        started_at=iso_now(),
+        interrupt_requested_at=None,
+        interrupt_reason=None,
+    )
+    write_active_run_record(repo_root, record)
+    return record
+
+
+def mark_interrupt_requested(
+    repo_root: Path,
+    mams_channel_name: str,
+    *,
+    reason: Optional[str],
+) -> Optional[ActiveRunRecord]:
+    record = read_active_run_record(repo_root, mams_channel_name)
+    if record is None:
+        return None
+    updated = replace(
+        record,
+        interrupt_requested_at=iso_now(),
+        interrupt_reason=reason,
+    )
+    write_active_run_record(repo_root, updated)
+    return updated
+
+
+def build_interrupt_error(record: ActiveRunRecord) -> str:
+    lines = [
+        f"Managed mams_channel '{record.mams_channel_name}' was interrupted by an explicit interrupt command.",
+        f"Interrupted runner: {record.runner}",
+        f"Interrupted command: {record.command}",
+    ]
+    if record.interrupt_reason:
+        lines.append(f"Interrupt reason: {record.interrupt_reason}")
+    return "\n".join(lines)
+
+
+def is_process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_process_group(pid: int, *, grace_period_s: float) -> bool:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    deadline = time.monotonic() + grace_period_s
+    while time.monotonic() < deadline:
+        if not is_process_alive(pid):
+            return True
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if not is_process_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not is_process_alive(pid)
 
 
 def iso_now() -> str:
@@ -874,6 +1065,26 @@ class InvokePayload:
     requests: tuple[InvokeRequest, ...]
 
 
+def parse_interrupt_payload(stdin_text: str) -> InterruptPayload:
+    if not stdin_text.strip():
+        return InterruptPayload(reason=None)
+    try:
+        obj = json.loads(stdin_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"interrupt input must be valid JSON when provided: {exc.msg}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError("interrupt input must be a JSON object when provided.")
+    unknown_keys = set(obj.keys()) - {"reason"}
+    if unknown_keys:
+        raise ValueError(f"interrupt input has unsupported fields: {', '.join(sorted(unknown_keys))}")
+    reason = obj.get("reason")
+    if reason is not None:
+        reason = normalize_optional_string(reason)
+        if reason is None:
+            raise ValueError("interrupt.reason must be a non-empty string when provided.")
+    return InterruptPayload(reason=reason)
+
+
 def parse_invoke_request_object(raw: object, *, index: int) -> InvokeRequest:
     if not isinstance(raw, dict):
         raise ValueError(f"invoke requests[{index}] must be a JSON object.")
@@ -1489,6 +1700,10 @@ def build_mams_reminder_text_for_invoker(tool: str, *, full: bool) -> str:
         "configure": (
             "This command applies a mams_invoker-supplied config patch. It does not mutate task files and it does not replace session continuity by itself."
         ),
+        "interrupt": (
+            "This command interrupts the currently active managed runner process for the selected mams_channel. "
+            "Use it when the current channel turn should stop immediately."
+        ),
         "dangerous-new-session": (
             "This command is for destructive continuity replacement. Use it only when the user explicitly authorizes abandoning or switching the managed session continuity."
         ),
@@ -1502,6 +1717,7 @@ def build_mams_reminder_text_for_invoker(tool: str, *, full: bool) -> str:
         "execute-this-plan": "Execute the approved plan as a substantial whole. Do not stop for trivial progress. Full Mad Agent Mesh reminder still applies, and the configured User Reminder still applies in full.",
         "execute-this-plan-part": "Execute only the approved plan part, and only use plan-part mode for genuinely large plans. The approved part must still be substantial. Full Mad Agent Mesh reminder still applies, and the configured User Reminder still applies in full.",
         "configure": "MAMS invoker-supplied config patch only. Full Mad Agent Mesh reminder still applies.",
+        "interrupt": "Interrupt the currently active managed runner process for the selected mams_channel. Full Mad Agent Mesh reminder still applies.",
         "dangerous-new-session": "Destructive continuity replacement. Full Mad Agent Mesh reminder still applies.",
     }
     selected = (full_map if full else brief_map).get(tool, "")
@@ -1519,7 +1735,7 @@ def collaborative_turn_index(tool: str, mams_channel: MamsChannelConfig) -> int:
 
 
 def should_use_full_reminder(tool: str, turn_index: int) -> bool:
-    if tool in {"init", "configure", "dangerous-new-session"}:
+    if tool in {"init", "configure", "interrupt", "dangerous-new-session"}:
         return True
     if turn_index <= 0:
         return True
@@ -2086,6 +2302,24 @@ class RunnerRunResult:
 
 
 @dataclass(frozen=True)
+class ActiveRunRecord:
+    run_id: str
+    mams_channel_name: str
+    runner: str
+    command: str
+    wrapper_pid: int
+    runner_pid: int
+    started_at: str
+    interrupt_requested_at: Optional[str]
+    interrupt_reason: Optional[str]
+
+
+@dataclass(frozen=True)
+class InterruptPayload:
+    reason: Optional[str]
+
+
+@dataclass(frozen=True)
 class InvokeSettledResult:
     request: InvokeRequest
     status: str
@@ -2315,6 +2549,7 @@ def execute_command_for_mams_channel(
         result = run_runner_for_mams_channel(
             repo_root=repo_root,
             mams_channel=mams_channel,
+            command=command,
             session_id=session_id,
             prompt=prompt,
             sandbox_mode=sandbox_mode,
@@ -2460,6 +2695,85 @@ def append_migration_notice(reply: str, migration_notice: Optional[str]) -> str:
     )
 
 
+def run_interrupt_command(
+    repo_root: Path,
+    stdin_text: str,
+    *,
+    mams_channel_name: str,
+    effective_default_model: Optional[str],
+    effective_default_reasoning_effort: Optional[str],
+) -> str:
+    payload = parse_interrupt_payload(stdin_text)
+    config, migration_notice, _created_canonical = resolve_config_for_update(
+        repo_root,
+        default_model=effective_default_model,
+        default_reasoning_effort=effective_default_reasoning_effort,
+    )
+    record = read_active_run_record(repo_root, mams_channel_name)
+    if record is None:
+        reply = (
+            f"No active managed runner process is currently recorded for mams_channel '{mams_channel_name}'."
+        )
+        return format_output_for_mams_invoker(
+            repo_root,
+            config,
+            tool="interrupt",
+            full_reminder=True,
+            reply=reply,
+            migration_notice=migration_notice,
+        )
+
+    if not is_process_alive(record.runner_pid):
+        clear_active_run_record(repo_root, mams_channel_name, run_id=record.run_id)
+        reply = (
+            f"Cleared a stale active-run record for mams_channel '{mams_channel_name}'. "
+            "No live managed runner process was found."
+        )
+        return format_output_for_mams_invoker(
+            repo_root,
+            config,
+            tool="interrupt",
+            full_reminder=True,
+            reply=reply,
+            migration_notice=migration_notice,
+        )
+
+    updated_record = mark_interrupt_requested(
+        repo_root,
+        mams_channel_name,
+        reason=payload.reason,
+    )
+    if updated_record is None:
+        updated_record = record
+
+    terminated = terminate_process_group(
+        updated_record.runner_pid,
+        grace_period_s=INTERRUPT_GRACE_PERIOD_S,
+    )
+    if not terminated:
+        raise RuntimeError(
+            f"Failed to interrupt managed runner process for mams_channel '{mams_channel_name}'."
+        )
+
+    lines = [
+        f"Interrupt sent to mams_channel '{mams_channel_name}'.",
+        f"Runner: {updated_record.runner}",
+        f"Command: {updated_record.command}",
+        f"Runner PID: {updated_record.runner_pid}",
+    ]
+    if updated_record.interrupt_reason:
+        lines.append(f"Reason: {updated_record.interrupt_reason}")
+    lines.append("The interrupted command should exit shortly and report an explicit interrupt error.")
+    return format_output_for_mams_invoker(
+        repo_root,
+        config,
+        tool="interrupt",
+        full_reminder=True,
+        reply="\n".join(lines),
+        migration_notice=migration_notice,
+    )
+
+
 def run_invoke_command(
     repo_root: Path,
     stdin_text: str,
@@ -2579,6 +2893,8 @@ def run_invoke_command(
 
 def run_codex(
     repo_root: Path,
+    mams_channel_name: str,
+    command: str,
     session_id: Optional[str],
     prompt: str,
     sandbox_mode: str,
@@ -2587,6 +2903,7 @@ def run_codex(
     reasoning_effort: Optional[str],
 ) -> RunnerRunResult:
     tmp_last = Path(tempfile.mkstemp(prefix="mad-agent-mesh-last-", suffix=".txt")[1])
+    active_run: Optional[ActiveRunRecord] = None
     try:
         base_args = [
             "exec",
@@ -2617,6 +2934,14 @@ def run_codex(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            start_new_session=True,
+        )
+        active_run = register_active_run(
+            repo_root,
+            mams_channel_name=mams_channel_name,
+            runner=RUNNER_CODEX,
+            command=command,
+            runner_pid=proc.pid,
         )
 
         thread_id: Optional[str] = None
@@ -2656,6 +2981,10 @@ def run_codex(
 
         if rc != 0:
             stderr = "\n".join(line for line in stderr_lines if line).strip()
+            if active_run is not None:
+                current_record = read_active_run_record(repo_root, mams_channel_name)
+                if current_record is not None and current_record.run_id == active_run.run_id and current_record.interrupt_requested_at:
+                    raise RuntimeError(build_interrupt_error(current_record))
             raise RuntimeError(stderr or f"codex exited with code {rc}")
 
         if not thread_id:
@@ -2671,6 +3000,8 @@ def run_codex(
 
         return RunnerRunResult(session_id=thread_id, reply=reply)
     finally:
+        if active_run is not None:
+            clear_active_run_record(repo_root, mams_channel_name, run_id=active_run.run_id)
         try:
             tmp_last.unlink(missing_ok=True)  # type: ignore[call-arg]
         except Exception:
@@ -2679,6 +3010,8 @@ def run_codex(
 
 def run_claude_code(
     repo_root: Path,
+    mams_channel_name: str,
+    command: str,
     session_id: Optional[str],
     prompt: str,
     sandbox_mode: str,
@@ -2688,6 +3021,7 @@ def run_claude_code(
     runner_config: dict[str, object],
 ) -> RunnerRunResult:
     tmp_stream = Path(tempfile.mkstemp(prefix="mad-agent-mesh-claude-stream-", suffix=".jsonl")[1])
+    active_run: Optional[ActiveRunRecord] = None
     try:
         permission_mode = resolve_claude_permission_mode(sandbox_mode, runner_config)
         disallowed_tools = resolve_claude_disallowed_tools(sandbox_mode, runner_config)
@@ -2719,6 +3053,14 @@ def run_claude_code(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            start_new_session=True,
+        )
+        active_run = register_active_run(
+            repo_root,
+            mams_channel_name=mams_channel_name,
+            runner=RUNNER_CLAUDE_CODE,
+            command=command,
+            runner_pid=proc.pid,
         )
 
         detected_session_id: Optional[str] = None
@@ -2794,6 +3136,10 @@ def run_claude_code(
         if rc != 0:
             stderr = "\n".join(line for line in stderr_lines if line).strip()
             stdout_error = "\n".join(item for item in result_errors if item).strip()
+            if active_run is not None:
+                current_record = read_active_run_record(repo_root, mams_channel_name)
+                if current_record is not None and current_record.run_id == active_run.run_id and current_record.interrupt_requested_at:
+                    raise RuntimeError(build_interrupt_error(current_record))
             base_error = stdout_error or stderr or f"claude-code exited with code {rc}"
             if rate_limit_reset_hint and rate_limit_reset_hint not in base_error:
                 base_error = f"{base_error}\n{rate_limit_reset_hint}"
@@ -2805,6 +3151,8 @@ def run_claude_code(
             raise RuntimeError("Failed to read Claude Code final result from stream-json output.")
         return RunnerRunResult(session_id=detected_session_id, reply=final_reply)
     finally:
+        if active_run is not None:
+            clear_active_run_record(repo_root, mams_channel_name, run_id=active_run.run_id)
         try:
             tmp_stream.unlink(missing_ok=True)  # type: ignore[call-arg]
         except Exception:
@@ -2814,6 +3162,7 @@ def run_claude_code(
 def run_runner_for_mams_channel(
     repo_root: Path,
     mams_channel: MamsChannelConfig,
+    command: str,
     session_id: Optional[str],
     prompt: str,
     sandbox_mode: str,
@@ -2824,6 +3173,8 @@ def run_runner_for_mams_channel(
     if mams_channel.runner == RUNNER_CODEX:
         return run_codex(
             repo_root=repo_root,
+            mams_channel_name=mams_channel.name,
+            command=command,
             session_id=session_id,
             prompt=prompt,
             sandbox_mode=sandbox_mode,
@@ -2834,6 +3185,8 @@ def run_runner_for_mams_channel(
     if mams_channel.runner == RUNNER_CLAUDE_CODE:
         return run_claude_code(
             repo_root=repo_root,
+            mams_channel_name=mams_channel.name,
+            command=command,
             session_id=session_id,
             prompt=prompt,
             sandbox_mode=sandbox_mode,
@@ -2980,7 +3333,7 @@ def main() -> int:
         raise RuntimeError("\n".join(lines))
 
     stdin_text = sys.stdin.read()
-    if not stdin_text.strip():
+    if args.cmd != "interrupt" and not stdin_text.strip():
         eprint("Empty input. Provide content via stdin.")
         return 2
 
@@ -3048,6 +3401,22 @@ def main() -> int:
             return 1
         return 0
 
+    if args.cmd == "interrupt":
+        try:
+            sys.stdout.write(
+                run_interrupt_command(
+                    repo_root,
+                    stdin_text,
+                    mams_channel_name=mams_channel_name,
+                    effective_default_model=effective_default_model,
+                    effective_default_reasoning_effort=effective_default_reasoning_effort,
+                )
+            )
+        except Exception as exc:
+            eprint(str(exc))
+            return 1
+        return 0
+
     if args.cmd == "dangerous-new-session":
         try:
             payload = parse_dangerous_new_session_payload(stdin_text)
@@ -3080,6 +3449,7 @@ def main() -> int:
                 result = run_runner_for_mams_channel(
                     repo_root=repo_root,
                     mams_channel=mams_channel,
+                    command="dangerous-new-session",
                     session_id=None,
                     prompt=prompt,
                     sandbox_mode=SANDBOX_READ_ONLY,

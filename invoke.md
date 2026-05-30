@@ -18,6 +18,7 @@ Use `invoke` as the preferred wrapper command when the mams_invoker wants one bl
 - mutating requests still run through the same wrapper entrypoint
 - the mams_invoker does not need to poll for status
 - the wrapper watches process health while waiting
+- if one specific active channel turn must stop, use `interrupt` against that `mams_channel`
 
 ## Input
 

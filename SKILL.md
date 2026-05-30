@@ -96,6 +96,7 @@ Use only one command per current workflow need.
 | Patch mams_invoker guidance, shared stage guidance, or mams_channel metadata | `configure.md` |
 | Bootstrap a new shared task or recover after compact/context clear | `init.md` |
 | Drive one or more mams_channel calls through one blocking wrapper call | `invoke.md` |
+| Interrupt the currently active runner process for a specific mams_channel | `interrupt.md` |
 | General discussion, coordination, disagreement handling, or review relay | `sync.md` |
 | Review a submitted plan before any execution begins | `review-this-plan.md` |
 | Review completed execution work before treating it as accepted or delivered | `review-this-work.md` |
@@ -106,6 +107,7 @@ Use only one command per current workflow need.
 
 - `init` is collaboration bootstrap only. It is not mutation.
 - `invoke` is the preferred blocking wrapper entrypoint when the mams_invoker wants one or more mams_channel calls and does not want to poll.
+- `interrupt` stops the currently active runner process for the selected mams_channel, whether that turn was started directly or through `invoke`.
 - `sync` is coordination only. It is not approval and not mutation permission.
 - `review-this-plan` is a hard gate before execution begins.
 - `review-this-work` is a hard gate before accepted delivery.

@@ -56,6 +56,7 @@ Important behavior:
 - `bin/review-this-work`
 - `bin/execute-this-plan`
 - `bin/execute-this-plan-part`
+- `bin/interrupt`
 - `bin/configure`
 - `bin/dangerous-new-session`
 
@@ -67,6 +68,7 @@ Preferred calling pattern:
 - let `invoke` wait internally instead of wrapping raw wrapper commands in external polling
 - if all requests are read-only, `invoke` will fan them out concurrently and return the settled results together
 - if any request mutates, `invoke` will still use one wrapper call, but it will run those requests sequentially
+- use `interrupt` when one specific active mams_channel turn must stop immediately, whether it was started directly or inside `invoke`
 
 Use:
 

@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin" / "mad_agent_mesh.py"
 CHANNELS_FILENAME = "mams_channels.json"
+RUNTIME_FILENAME = "mams_runtime.json"
 ACTIVE_RUNS_DIRNAME = "active-runs"
 LEGACY_SESSION_FILENAME = "codex_session.json"
 LEGACY_HISTORY_FILENAME = "codex_session_history.json"
@@ -331,11 +332,15 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
                     capture = None
 
             agents_path = managed_dir / CHANNELS_FILENAME
+            runtime_path = managed_dir / RUNTIME_FILENAME
+            static_payload = json.loads(agents_path.read_text(encoding="utf-8")) if agents_path.exists() else None
+            runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8")) if runtime_path.exists() else None
             state = {
                 "mams_channels_exists": agents_path.exists(),
-                "mams_channels_payload": (
-                    json.loads(agents_path.read_text(encoding="utf-8")) if agents_path.exists() else None
-                ),
+                "runtime_exists": runtime_path.exists(),
+                "static_payload": static_payload,
+                "runtime_payload": runtime_payload,
+                "mams_channels_payload": self.build_effective_payload(static_payload, runtime_payload),
                 "legacy_session_exists": (legacy_dir / LEGACY_SESSION_FILENAME).exists(),
                 "legacy_history_exists": (legacy_dir / LEGACY_HISTORY_FILENAME).exists(),
             }
@@ -375,6 +380,39 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         if env_extra:
             env.update(env_extra)
         return tempdir, workspace, env, managed_dir
+
+    @staticmethod
+    def build_effective_payload(
+        static_payload: Optional[dict],
+        runtime_payload: Optional[dict],
+    ) -> Optional[dict]:
+        if static_payload is None:
+            return None
+        payload = json.loads(json.dumps(static_payload))
+        runtime_invoker = (runtime_payload or {}).get("mams_invoker", {})
+        if isinstance(payload.get("mams_invoker"), dict):
+            payload["mams_invoker"]["reminder_turn_count"] = int(runtime_invoker.get("reminder_turn_count", 0) or 0)
+        runtime_channels = {}
+        for item in (runtime_payload or {}).get("mams_channels", []):
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                runtime_channels[item["name"]] = item
+        for mams_channel in payload.get("mams_channels", []):
+            if not isinstance(mams_channel, dict):
+                continue
+            runtime_state = runtime_channels.get(mams_channel.get("name"))
+            if runtime_state is None:
+                mams_channel["session_id"] = None
+                mams_channel["previous_session_ids"] = []
+                mams_channel["reminder_turn_count"] = 0
+                continue
+            mams_channel["session_id"] = runtime_state.get("session_id")
+            mams_channel["previous_session_ids"] = runtime_state.get("previous_session_ids", [])
+            mams_channel["reminder_turn_count"] = int(runtime_state.get("reminder_turn_count", 0) or 0)
+            if "updated_at" in runtime_state:
+                mams_channel["updated_at"] = runtime_state["updated_at"]
+        if runtime_payload and "updated_at" in runtime_payload:
+            payload["updated_at"] = runtime_payload["updated_at"]
+        return payload
 
     @staticmethod
     def wait_for_path(path: Path, *, timeout_s: float = 5.0) -> bool:
@@ -816,6 +854,74 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertIn("<<<SYNC_MESSAGE.BEGIN>>>", capture["stdin"])
         self.assertIn("Sync message from the mams_invoker:", capture["stdin"])
         self.assertIn("## Plan", proc.stdout)
+
+    def test_runtime_persistence_does_not_overwrite_static_config_edits_made_during_run(self) -> None:
+        tempdir, workspace, env, managed_dir = self.create_test_runtime(
+            initial_mams_channels=[self.build_mams_channel("planner", session_id="planner-session")],
+            env_extra={
+                "FAKE_CODEX_SLEEP_S": "1",
+                "FAKE_CHANNEL_REPLY": "## Discussion Reply\n\nStill investigating.",
+            },
+        )
+        try:
+            static_path = managed_dir / CHANNELS_FILENAME
+            runtime_path = managed_dir / RUNTIME_FILENAME
+            argv = [
+                sys.executable,
+                str(SCRIPT),
+                "--cwd",
+                str(workspace),
+                "--mams-channel",
+                "planner",
+                "sync",
+            ]
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=str(ROOT),
+            )
+            assert proc.stdin is not None
+            proc.stdin.write('{"sync_message":"Please continue investigating."}')
+            proc.stdin.close()
+
+            time.sleep(0.2)
+
+            static_payload = json.loads(static_path.read_text(encoding="utf-8"))
+            static_payload["mams_invoker"]["working_style"] = "STATIC CHANGE DURING RUN"
+            static_path.write_text(
+                json.dumps(static_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            returncode = proc.wait(timeout=5)
+            stdout = proc.stdout.read() if proc.stdout is not None else ""
+            stderr = proc.stderr.read() if proc.stderr is not None else ""
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
+            self.assertEqual(returncode, 0, stderr)
+
+            final_static_payload = json.loads(static_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                final_static_payload["mams_invoker"]["working_style"],
+                "STATIC CHANGE DURING RUN",
+            )
+            self.assertTrue(runtime_path.exists())
+            runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+            self.assertEqual(runtime_payload["mams_invoker"]["reminder_turn_count"], 1)
+            runtime_planner = next(
+                item for item in runtime_payload["mams_channels"] if item["name"] == "planner"
+            )
+            self.assertEqual(runtime_planner["session_id"], "planner-session")
+            self.assertEqual(runtime_planner["reminder_turn_count"], 1)
+            self.assertIn("## Discussion Reply", stdout)
+        finally:
+            tempdir.cleanup()
 
     def test_interrupt_stops_direct_channel_turn(self) -> None:
         tempdir, workspace, env, managed_dir = self.create_test_runtime(

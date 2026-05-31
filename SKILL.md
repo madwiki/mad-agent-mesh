@@ -9,11 +9,13 @@ description: >
 
 This skill is mams_invoker-agnostic. The mams_invoker may be Claude Code, Codex, OpenCode, or another tool that invokes the wrapper commands. The targeted managed channel does not speak to the end user directly. The mams_invoker remains responsible for user-facing conversation and for asking the user to decide unresolved issues.
 
-Session continuity is wrapper-managed. Use only commands under `<skill_root>/bin/`. Do not call raw runner CLIs directly. Do not manually edit, delete, or replace `<repo>/.mad-agent-mesh/mams_channels.json`.
+Session continuity is wrapper-managed. Use only commands under `<skill_root>/bin/`. Do not call raw runner CLIs directly. Treat `<repo>/.mad-agent-mesh/mams_runtime.json` as wrapper-owned runtime state.
 
 ## Managed config
 
-The managed config lives at `<repo>/.mad-agent-mesh/mams_channels.json`.
+The static managed config lives at `<repo>/.mad-agent-mesh/mams_channels.json`.
+
+The wrapper-managed runtime state lives at `<repo>/.mad-agent-mesh/mams_runtime.json`.
 
 Top-level fields:
 
@@ -40,14 +42,16 @@ Top-level fields:
 - `can_mutate`
 - `runner`
 - `runner_config`
-- `session_id`
 - `model`
 - `reasoning_effort`
-- `previous_session_ids`
+
+Runtime-only fields such as managed session continuity and reminder turn counters live in `mams_runtime.json`, not in `mams_channels.json`.
 
 `mams_invoker.can_mutate` is a reminder field only. The wrapper cannot enforce it because the mams_invoker is outside the managed runner runtime.
 
 `mams_channels[*].can_mutate` is enforced. Only mams_channels with `can_mutate: true` may use `execute-this-plan` or `execute-this-plan-part`.
+
+Normal turns persist runtime state only. They do not rewrite `mams_channels.json`.
 
 ## Injection boundaries
 

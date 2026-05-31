@@ -20,9 +20,13 @@ git clone https://github.com/madwiki/mad-agent-mesh ~/.claude/skills/mad-agent-m
 
 ## Config
 
-The managed config lives at:
+The static managed config lives at:
 
 `<repo>/.mad-agent-mesh/mams_channels.json`
+
+The wrapper-managed runtime state lives at:
+
+`<repo>/.mad-agent-mesh/mams_runtime.json`
 
 Top-level keys:
 
@@ -44,6 +48,7 @@ Important behavior:
 - `mams_invoker.*` is returned to the mams_invoker, not injected into managed channel prompts.
 - `mams_channels[*].*` is injected only into the targeted managed channel prompt.
 - `shared_stages` may be shown on both sides.
+- normal turns update runtime state only; they do not rewrite the static config file
 - wrapper-generated blocks are boundary-tagged with `<<<NAME.BEGIN>>> ... <<<NAME.END>>>`
 - block names use underscores; block state uses dotted suffixes such as `.BEGIN` and `.END`
 
@@ -77,4 +82,4 @@ Use:
 ## Notes
 
 - Use wrapper commands only. Do not call raw runner CLIs directly.
-- Do not manually edit or delete the managed config.
+- Treat `mams_runtime.json` as wrapper-owned runtime state.

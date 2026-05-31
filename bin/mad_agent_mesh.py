@@ -76,6 +76,7 @@ PROCESS_IDLE_TIMEOUT_S = 600
 INTERRUPT_GRACE_PERIOD_S = 3.0
 SHARED_WORKSPACE_SENTENCE = "The shared workspace for this workflow is `<repo>/.mad-agent-mesh/`."
 MAMS_CHANNELS_FILENAME = "mams_channels.json"
+MAMS_RUNTIME_FILENAME = "mams_runtime.json"
 ACTIVE_RUNS_DIRNAME = "active-runs"
 LEGACY_SESSION_FILENAME = "codex_session.json"
 LEGACY_HISTORY_FILENAME = "codex_session_history.json"
@@ -200,6 +201,10 @@ def candidate_roots_with_managed_dir(start: Path, limit: int = 5) -> list[Path]:
 
 def mams_channels_file_path(repo_root: Path) -> Path:
     return repo_root / MANAGED_DIRNAME / MAMS_CHANNELS_FILENAME
+
+
+def mams_runtime_file_path(repo_root: Path) -> Path:
+    return repo_root / MANAGED_DIRNAME / MAMS_RUNTIME_FILENAME
 
 
 def active_runs_dir(repo_root: Path) -> Path:
@@ -450,6 +455,28 @@ class MamsSkillConfig:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class MamsChannelRuntimeState:
+    name: str
+    session_id: Optional[str]
+    previous_session_ids: tuple[str, ...]
+    reminder_turn_count: int
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class MamsInvokerRuntimeState:
+    reminder_turn_count: int
+
+
+@dataclass(frozen=True)
+class MamsRuntimeState:
+    version: int
+    mams_invoker: MamsInvokerRuntimeState
+    mams_channels: list[MamsChannelRuntimeState]
+    updated_at: str
+
+
 def normalize_optional_string(value: object) -> Optional[str]:
     if value is None:
         return None
@@ -606,12 +633,8 @@ def mams_channel_config_to_json(mams_channel: MamsChannelConfig) -> dict[str, ob
         "can_mutate": mams_channel.can_mutate,
         "runner": mams_channel.runner,
         "runner_config": mams_channel.runner_config,
-        "session_id": mams_channel.session_id,
         "model": mams_channel.model,
         "reasoning_effort": mams_channel.reasoning_effort,
-        "previous_session_ids": list(mams_channel.previous_session_ids),
-        "reminder_turn_count": mams_channel.reminder_turn_count,
-        "updated_at": mams_channel.updated_at,
     }
 
 
@@ -661,7 +684,104 @@ def mams_invoker_config_to_json(config: MamsInvokerConfig) -> dict[str, object]:
         "extra_context": config.extra_context,
         "stage_guidance": config.stage_guidance,
         "can_mutate": config.can_mutate,
-        "reminder_turn_count": config.reminder_turn_count,
+    }
+
+
+def build_mams_channel_runtime_state(mams_channel: MamsChannelConfig) -> MamsChannelRuntimeState:
+    return MamsChannelRuntimeState(
+        name=mams_channel.name,
+        session_id=mams_channel.session_id,
+        previous_session_ids=mams_channel.previous_session_ids,
+        reminder_turn_count=mams_channel.reminder_turn_count,
+        updated_at=mams_channel.updated_at,
+    )
+
+
+def parse_mams_channel_runtime_state(obj: object) -> MamsChannelRuntimeState:
+    if not isinstance(obj, dict):
+        raise ValueError("Each mams_channel runtime entry must be a JSON object.")
+    name = normalize_optional_string(obj.get("name"))
+    if not name:
+        raise ValueError("Each mams_channel runtime entry requires a non-empty string field: name.")
+    updated_at = normalize_optional_string(obj.get("updated_at")) or iso_now()
+    return MamsChannelRuntimeState(
+        name=name,
+        session_id=normalize_optional_string(obj.get("session_id")),
+        previous_session_ids=normalize_previous_session_ids(obj.get("previous_session_ids")),
+        reminder_turn_count=max(0, int(obj.get("reminder_turn_count", 0) or 0)),
+        updated_at=updated_at,
+    )
+
+
+def mams_channel_runtime_state_to_json(state: MamsChannelRuntimeState) -> dict[str, object]:
+    return {
+        "name": state.name,
+        "session_id": state.session_id,
+        "previous_session_ids": list(state.previous_session_ids),
+        "reminder_turn_count": state.reminder_turn_count,
+        "updated_at": state.updated_at,
+    }
+
+
+def build_runtime_state_from_config(config: MamsSkillConfig) -> MamsRuntimeState:
+    return MamsRuntimeState(
+        version=CONFIG_VERSION,
+        mams_invoker=MamsInvokerRuntimeState(reminder_turn_count=config.mams_invoker.reminder_turn_count),
+        mams_channels=[build_mams_channel_runtime_state(mams_channel) for mams_channel in config.mams_channels],
+        updated_at=config.updated_at,
+    )
+
+
+def default_mams_runtime_state() -> MamsRuntimeState:
+    return MamsRuntimeState(
+        version=CONFIG_VERSION,
+        mams_invoker=MamsInvokerRuntimeState(reminder_turn_count=0),
+        mams_channels=[],
+        updated_at=iso_now(),
+    )
+
+
+def parse_mams_runtime_state_object(obj: object, *, path: Path) -> MamsRuntimeState:
+    if not isinstance(obj, dict):
+        raise RuntimeError(f"MAMS runtime file must contain a JSON object: {path}")
+    mams_channels_value = obj.get("mams_channels", [])
+    if not isinstance(mams_channels_value, list):
+        raise RuntimeError(f"Runtime field 'mams_channels' must be a JSON array: {path}")
+    mams_channels: list[MamsChannelRuntimeState] = []
+    seen: set[str] = set()
+    for raw in mams_channels_value:
+        try:
+            runtime_state = parse_mams_channel_runtime_state(raw)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if runtime_state.name in seen:
+            raise RuntimeError(f"Duplicate mams_channel runtime name in {path}: {runtime_state.name}")
+        seen.add(runtime_state.name)
+        mams_channels.append(runtime_state)
+    raw_invoker = obj.get("mams_invoker", {})
+    if raw_invoker is None:
+        raw_invoker = {}
+    if not isinstance(raw_invoker, dict):
+        raise RuntimeError(f"Runtime field 'mams_invoker' must be a JSON object: {path}")
+    updated_at = normalize_optional_string(obj.get("updated_at")) or iso_now()
+    return MamsRuntimeState(
+        version=CONFIG_VERSION,
+        mams_invoker=MamsInvokerRuntimeState(
+            reminder_turn_count=max(0, int(raw_invoker.get("reminder_turn_count", 0) or 0)),
+        ),
+        mams_channels=mams_channels,
+        updated_at=updated_at,
+    )
+
+
+def runtime_state_to_json(state: MamsRuntimeState) -> dict[str, object]:
+    return {
+        "version": state.version,
+        "mams_invoker": {
+            "reminder_turn_count": state.mams_invoker.reminder_turn_count,
+        },
+        "mams_channels": [mams_channel_runtime_state_to_json(mams_channel) for mams_channel in state.mams_channels],
+        "updated_at": state.updated_at,
     }
 
 
@@ -712,34 +832,108 @@ def skill_config_to_json(config: MamsSkillConfig) -> dict[str, object]:
     }
 
 
+def apply_runtime_state(
+    static_config: MamsSkillConfig,
+    runtime_state: MamsRuntimeState,
+) -> MamsSkillConfig:
+    runtime_channels = {mams_channel.name: mams_channel for mams_channel in runtime_state.mams_channels}
+    merged_channels: list[MamsChannelConfig] = []
+    for mams_channel in static_config.mams_channels:
+        runtime_channel = runtime_channels.get(mams_channel.name)
+        if runtime_channel is None:
+            merged_channels.append(
+                replace(
+                    mams_channel,
+                    session_id=None,
+                    previous_session_ids=(),
+                    reminder_turn_count=0,
+                )
+            )
+            continue
+        merged_channels.append(
+            replace(
+                mams_channel,
+                session_id=runtime_channel.session_id,
+                previous_session_ids=runtime_channel.previous_session_ids,
+                reminder_turn_count=runtime_channel.reminder_turn_count,
+                updated_at=runtime_channel.updated_at,
+            )
+        )
+    return MamsSkillConfig(
+        version=static_config.version,
+        mams_invoker=replace(
+            static_config.mams_invoker,
+            reminder_turn_count=runtime_state.mams_invoker.reminder_turn_count,
+        ),
+        shared_stages=static_config.shared_stages,
+        mams_channels=merged_channels,
+        updated_at=runtime_state.updated_at or static_config.updated_at,
+    )
+
+
+def config_embeds_runtime_fields(obj: object) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    raw_invoker = obj.get("mams_invoker", obj.get("invoker", obj.get("caller", obj.get("claude"))))
+    if isinstance(raw_invoker, dict) and "reminder_turn_count" in raw_invoker:
+        return True
+    raw_channels = obj.get("mams_channels", obj.get("channels", obj.get("agents")))
+    if isinstance(raw_channels, list):
+        for raw in raw_channels:
+            if not isinstance(raw, dict):
+                continue
+            if any(
+                key in raw
+                for key in ("session_id", "previous_session_ids", "reminder_turn_count", "updated_at")
+            ):
+                return True
+    return False
+
+
 def read_skill_config(repo_root: Path) -> MamsSkillConfig:
-    path = mams_channels_file_path(repo_root)
-    if not path.exists():
+    config_path = mams_channels_file_path(repo_root)
+    if not config_path.exists():
         return default_mams_skill_config()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(config_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid mams_channel config JSON in {path}: {exc.msg}") from exc
+        raise RuntimeError(f"Invalid mams_channel config JSON in {config_path}: {exc.msg}") from exc
     if isinstance(data, list):
         mams_channels = []
         seen: set[str] = set()
         for raw in data:
             mams_channel = parse_mams_channel_config(raw)
             if mams_channel.name in seen:
-                raise RuntimeError(f"Duplicate mams_channel name in {path}: {mams_channel.name}")
+                raise RuntimeError(f"Duplicate mams_channel name in {config_path}: {mams_channel.name}")
             seen.add(mams_channel.name)
             mams_channels.append(mams_channel)
-        return default_mams_skill_config(mams_channels)
-    return parse_skill_config_object(data, path=path)
+        static_config = default_mams_skill_config(mams_channels)
+    else:
+        static_config = parse_skill_config_object(data, path=config_path)
+    runtime_path = mams_runtime_file_path(repo_root)
+    if not runtime_path.exists():
+        return static_config
+    try:
+        runtime_data = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid mams runtime JSON in {runtime_path}: {exc.msg}") from exc
+    runtime_state = parse_mams_runtime_state_object(runtime_data, path=runtime_path)
+    return apply_runtime_state(static_config, runtime_state)
 
 
-def write_skill_config(repo_root: Path, config: MamsSkillConfig) -> None:
-    path = mams_channels_file_path(repo_root)
+def write_json_file(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = skill_config_to_json(config)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
+
+
+def write_static_config(repo_root: Path, config: MamsSkillConfig) -> None:
+    write_json_file(mams_channels_file_path(repo_root), skill_config_to_json(config))
+
+
+def write_runtime_state(repo_root: Path, state: MamsRuntimeState) -> None:
+    write_json_file(mams_runtime_file_path(repo_root), runtime_state_to_json(state))
 
 
 def read_legacy_session_id(repo_root: Path) -> Optional[str]:
@@ -801,6 +995,7 @@ def load_migration_source(
     default_reasoning_effort: Optional[str],
 ) -> Optional[MigrationSource]:
     config_path = mams_channels_file_path(repo_root)
+    runtime_path = mams_runtime_file_path(repo_root)
 
     if config_path.exists():
         try:
@@ -808,7 +1003,8 @@ def load_migration_source(
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Invalid mams_channel config JSON in {config_path}: {exc.msg}") from exc
         if isinstance(data, dict):
-            if not structured_config_needs_migration(data):
+            needs_runtime_split = config_embeds_runtime_fields(data) or not runtime_path.exists()
+            if not structured_config_needs_migration(data) and not needs_runtime_split:
                 return None
             return MigrationSource(
                 kind="current-structured",
@@ -882,20 +1078,22 @@ def migrate_mams_channels_config_to_latest(
     )
     if source is None:
         return None
-    write_skill_config(repo_root, source.config)
+    write_static_config(repo_root, source.config)
+    write_runtime_state(repo_root, build_runtime_state_from_config(source.config))
     destination = mams_channels_file_path(repo_root)
+    runtime_destination = mams_runtime_file_path(repo_root)
     if source.kind == "legacy-session":
         return (
-            "Legacy session continuity files were read, normalized, and rewritten into the canonical config at "
-            f"{destination}."
+            "Legacy session continuity files were read, normalized, and rewritten into the canonical config/runtime files at "
+            f"{destination} and {runtime_destination}."
         )
     if source.path is not None and source.path != destination:
         return (
-            f"Legacy config at {source.path} was read, normalized, and rewritten into the canonical config at {destination}. "
+            f"Legacy config at {source.path} was read, normalized, and rewritten into the canonical config/runtime files at {destination} and {runtime_destination}. "
             "User-authored reminder text was left unchanged."
         )
     return (
-        f"Config at {destination} was normalized and rewritten into the canonical version {CONFIG_VERSION} format. "
+        f"Config at {destination} was normalized and split into canonical config/runtime files at {destination} and {runtime_destination}. "
         "User-authored reminder text was left unchanged."
     )
 
@@ -2665,7 +2863,7 @@ def resolve_config_for_update(
         config = read_skill_config(repo_root)
     else:
         config = default_mams_skill_config([])
-        write_skill_config(repo_root, config)
+        write_static_config(repo_root, config)
         created_canonical = True
     return config, migration_notice, created_canonical
 
@@ -2675,14 +2873,18 @@ def persist_mams_channels_for_command(
     config: MamsSkillConfig,
     mams_channel: MamsChannelConfig,
 ) -> MamsSkillConfig:
+    latest_config = read_skill_config(repo_root)
+    created_static_channel = find_mams_channel(latest_config.mams_channels, mams_channel.name) is None
     updated_config = MamsSkillConfig(
         version=CONFIG_VERSION,
-        mams_invoker=config.mams_invoker,
-        shared_stages=config.shared_stages,
-        mams_channels=upsert_mams_channel(config.mams_channels, replace(mams_channel, updated_at=iso_now())),
+        mams_invoker=latest_config.mams_invoker,
+        shared_stages=latest_config.shared_stages,
+        mams_channels=upsert_mams_channel(latest_config.mams_channels, replace(mams_channel, updated_at=iso_now())),
         updated_at=iso_now(),
     )
-    write_skill_config(repo_root, updated_config)
+    if created_static_channel:
+        write_static_config(repo_root, updated_config)
+    write_runtime_state(repo_root, build_runtime_state_from_config(updated_config))
     return updated_config
 
 
@@ -2691,20 +2893,26 @@ def persist_multiple_mams_channels(
     config: MamsSkillConfig,
     mams_channels: list[MamsChannelConfig],
 ) -> MamsSkillConfig:
-    updated_channels = config.mams_channels
+    latest_config = read_skill_config(repo_root)
+    updated_channels = latest_config.mams_channels
+    created_static_channel = False
     for mams_channel in mams_channels:
+        if find_mams_channel(updated_channels, mams_channel.name) is None:
+            created_static_channel = True
         updated_channels = upsert_mams_channel(
             updated_channels,
             replace(mams_channel, updated_at=iso_now()),
         )
     updated_config = MamsSkillConfig(
         version=CONFIG_VERSION,
-        mams_invoker=config.mams_invoker,
-        shared_stages=config.shared_stages,
+        mams_invoker=latest_config.mams_invoker,
+        shared_stages=latest_config.shared_stages,
         mams_channels=updated_channels,
         updated_at=iso_now(),
     )
-    write_skill_config(repo_root, updated_config)
+    if created_static_channel:
+        write_static_config(repo_root, updated_config)
+    write_runtime_state(repo_root, build_runtime_state_from_config(updated_config))
     return updated_config
 
 
@@ -2903,7 +3111,7 @@ def run_invoke_command(
         else config
     )
     updated_config = increment_mams_invoker_turn_count(updated_config, tool="invoke")
-    write_skill_config(repo_root, updated_config)
+    write_runtime_state(repo_root, build_runtime_state_from_config(updated_config))
     for updated_mams_channel in updated_channels:
         if updated_mams_channel.runner == RUNNER_CODEX:
             try_promote_exec_session_to_cli(updated_mams_channel.session_id)
@@ -3380,7 +3588,7 @@ def main() -> int:
                 default_reasoning_effort=effective_default_reasoning_effort,
             )
             updated_config = apply_configure_payload(config, payload)
-            write_skill_config(repo_root, updated_config)
+            write_static_config(repo_root, updated_config)
         except Exception as exc:
             eprint(str(exc))
             return 1
@@ -3510,7 +3718,19 @@ def main() -> int:
                 previous_session_ids=previous_session_ids,
                 reminder_turn_count=0,
             )
-            persist_mams_channels_for_command(repo_root, config, updated_mams_channel)
+            latest_config = read_skill_config(repo_root)
+            updated_config = MamsSkillConfig(
+                version=CONFIG_VERSION,
+                mams_invoker=latest_config.mams_invoker,
+                shared_stages=latest_config.shared_stages,
+                mams_channels=upsert_mams_channel(
+                    latest_config.mams_channels,
+                    replace(updated_mams_channel, updated_at=iso_now()),
+                ),
+                updated_at=iso_now(),
+            )
+            write_static_config(repo_root, updated_config)
+            write_runtime_state(repo_root, build_runtime_state_from_config(updated_config))
         except Exception as exc:
             eprint(str(exc))
             return 1
@@ -3582,7 +3802,7 @@ def main() -> int:
 
     updated_config = persist_mams_channels_for_command(repo_root, config, updated_mams_channel)
     updated_config = increment_mams_invoker_turn_count(updated_config, tool=args.cmd)
-    write_skill_config(repo_root, updated_config)
+    write_runtime_state(repo_root, build_runtime_state_from_config(updated_config))
     if updated_mams_channel.runner == RUNNER_CODEX:
         try_promote_exec_session_to_cli(updated_mams_channel.session_id)
 

@@ -222,6 +222,7 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
                 "extra_context": None,
                 "stage_guidance": {},
                 "can_mutate": True,
+                "reminder_turn_count": 0,
             },
             "shared_stages": shared_stages or {},
             "mams_channels": mams_channels,
@@ -707,6 +708,7 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
                 "extra_context": None,
                 "stage_guidance": {},
                 "can_mutate": False,
+                "reminder_turn_count": 1,
             },
         )
         proc, capture, state = self.run_skill(
@@ -730,6 +732,8 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertNotIn("The shared workspace for this workflow is `<repo>/.mad-agent-mesh/`.", proc.stdout)
         self.assertIn("## User Reminder", proc.stdout)
         self.assertIn("### MAMS Invoker Baseline", proc.stdout)
+        invoker = state["mams_channels_payload"]["mams_invoker"]
+        self.assertEqual(invoker["reminder_turn_count"], 2)
         mams_channel = self.find_mams_channel(state, "default")
         self.assertEqual(mams_channel["reminder_turn_count"], 2)
 
@@ -1112,6 +1116,51 @@ class MadAgentMeshIntegrationTests(unittest.TestCase):
         self.assertEqual(reviewer_b["session_id"], "session-b")
         self.assertEqual(reviewer_a["reminder_turn_count"], 1)
         self.assertEqual(reviewer_b["reminder_turn_count"], 1)
+        self.assertEqual(state["mams_channels_payload"]["mams_invoker"]["reminder_turn_count"], 1)
+
+    def test_invoke_uses_invoker_brief_cadence_independent_of_channel_counts(self) -> None:
+        payload = json.dumps(
+            {
+                "requests": [
+                    {
+                        "command": "review-this-plan",
+                        "mams_channel": "reviewer-a",
+                        "input": {"plan_for_review": "Plan A"},
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        initial_config = self.build_config(
+            [
+                self.build_mams_channel("reviewer-a", can_mutate=False, reminder_turn_count=0),
+            ],
+            mams_invoker={
+                "baseline": "Invoker baseline.",
+                "working_style": "Invoker style.",
+                "extra_context": None,
+                "stage_guidance": {},
+                "can_mutate": False,
+                "reminder_turn_count": 1,
+            },
+        )
+        proc, _capture, state = self.run_skill(
+            "invoke",
+            payload,
+            initial_config=initial_config,
+            env_extra={
+                "FAKE_CHANNEL_REPLY_MAP": json.dumps(
+                    {"Plan A": "approved_to_mutate: true\n\n## Plan Review Reply\n\nReviewer A approves."},
+                    ensure_ascii=False,
+                ),
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("## Mad Agent Mesh Reminder (Brief)", proc.stdout)
+        self.assertNotIn("The shared workspace for this workflow is `<repo>/.mad-agent-mesh/`.", proc.stdout)
+        self.assertEqual(state["mams_channels_payload"]["mams_invoker"]["reminder_turn_count"], 2)
+        reviewer_a = self.find_mams_channel(state, "reviewer-a")
+        self.assertEqual(reviewer_a["reminder_turn_count"], 1)
 
     def test_invoke_reports_partial_failures_without_failing_fast(self) -> None:
         payload = json.dumps(

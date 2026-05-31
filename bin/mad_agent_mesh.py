@@ -438,6 +438,7 @@ class MamsInvokerConfig:
     extra_context: Optional[str]
     stage_guidance: dict[str, str]
     can_mutate: bool
+    reminder_turn_count: int
 
 
 @dataclass(frozen=True)
@@ -621,6 +622,7 @@ def default_mams_invoker_config() -> MamsInvokerConfig:
         extra_context=None,
         stage_guidance={},
         can_mutate=True,
+        reminder_turn_count=0,
     )
 
 
@@ -648,6 +650,7 @@ def parse_mams_invoker_config(obj: object) -> MamsInvokerConfig:
         extra_context=normalize_optional_string(obj.get("extra_context")),
         stage_guidance=normalize_stage_guidance_map(obj.get("stage_guidance"), field_name="mams_invoker.stage_guidance"),
         can_mutate=raw_can_mutate,
+        reminder_turn_count=max(0, int(obj.get("reminder_turn_count", 0) or 0)),
     )
 
 
@@ -658,6 +661,7 @@ def mams_invoker_config_to_json(config: MamsInvokerConfig) -> dict[str, object]:
         "extra_context": config.extra_context,
         "stage_guidance": config.stage_guidance,
         "can_mutate": config.can_mutate,
+        "reminder_turn_count": config.reminder_turn_count,
     }
 
 
@@ -951,6 +955,7 @@ def apply_configure_payload(
                 stage_patch if isinstance(stage_patch, dict) else None,
             ),
             can_mutate=payload.mams_invoker_patch["can_mutate"] if "can_mutate" in payload.mams_invoker_patch else mams_invoker.can_mutate,
+            reminder_turn_count=mams_invoker.reminder_turn_count,
         )
 
     shared_stages = merge_string_map(config.shared_stages, payload.shared_stages_patch)
@@ -1734,12 +1739,32 @@ def collaborative_turn_index(tool: str, mams_channel: MamsChannelConfig) -> int:
     return 0
 
 
+def invoker_collaborative_turn_index(tool: str, mams_invoker: MamsInvokerConfig) -> int:
+    if tool in {"invoke", "sync", "review-this-plan", "review-this-work", "execute-this-plan", "execute-this-plan-part"}:
+        return mams_invoker.reminder_turn_count + 1
+    return 0
+
+
 def should_use_full_reminder(tool: str, turn_index: int) -> bool:
     if tool in {"init", "configure", "interrupt", "dangerous-new-session"}:
         return True
     if turn_index <= 0:
         return True
     return (turn_index - 1) % 3 == 0
+
+
+def increment_mams_invoker_turn_count(config: MamsSkillConfig, *, tool: str) -> MamsSkillConfig:
+    if tool not in {"invoke", "sync", "review-this-plan", "review-this-work", "execute-this-plan", "execute-this-plan-part"}:
+        return config
+    updated_invoker = replace(
+        config.mams_invoker,
+        reminder_turn_count=config.mams_invoker.reminder_turn_count + 1,
+    )
+    return replace(
+        config,
+        mams_invoker=updated_invoker,
+        updated_at=iso_now(),
+    )
 
 
 def build_common_stage_items(
@@ -2649,17 +2674,16 @@ def persist_mams_channels_for_command(
     repo_root: Path,
     config: MamsSkillConfig,
     mams_channel: MamsChannelConfig,
-) -> None:
-    write_skill_config(
-        repo_root,
-        MamsSkillConfig(
-            version=CONFIG_VERSION,
-            mams_invoker=config.mams_invoker,
-            shared_stages=config.shared_stages,
-            mams_channels=upsert_mams_channel(config.mams_channels, replace(mams_channel, updated_at=iso_now())),
-            updated_at=iso_now(),
-        ),
+) -> MamsSkillConfig:
+    updated_config = MamsSkillConfig(
+        version=CONFIG_VERSION,
+        mams_invoker=config.mams_invoker,
+        shared_stages=config.shared_stages,
+        mams_channels=upsert_mams_channel(config.mams_channels, replace(mams_channel, updated_at=iso_now())),
+        updated_at=iso_now(),
     )
+    write_skill_config(repo_root, updated_config)
+    return updated_config
 
 
 def persist_multiple_mams_channels(
@@ -2791,6 +2815,8 @@ def run_invoke_command(
         default_model=effective_default_model,
         default_reasoning_effort=effective_default_reasoning_effort,
     )
+    invoker_turn_index = invoker_collaborative_turn_index("invoke", config.mams_invoker)
+    invoker_full_reminder = should_use_full_reminder("invoke", invoker_turn_index)
 
     prepared: list[tuple[InvokeRequest, MamsChannelConfig, bool, Optional[str], Optional[str]]] = []
     seen_channel_names: set[str] = set()
@@ -2876,6 +2902,8 @@ def run_invoke_command(
         if updated_channels
         else config
     )
+    updated_config = increment_mams_invoker_turn_count(updated_config, tool="invoke")
+    write_skill_config(repo_root, updated_config)
     for updated_mams_channel in updated_channels:
         if updated_mams_channel.runner == RUNNER_CODEX:
             try_promote_exec_session_to_cli(updated_mams_channel.session_id)
@@ -2885,7 +2913,7 @@ def run_invoke_command(
         repo_root,
         updated_config,
         tool="invoke",
-        full_reminder=True,
+        full_reminder=invoker_full_reminder,
         reply=summary,
         migration_notice=migration_notice,
     )
@@ -3533,6 +3561,8 @@ def main() -> int:
     reasoning_effort = args.reasoning_effort or mams_channel.reasoning_effort or DEFAULT_REASONING_EFFORT
     turn_index = collaborative_turn_index(args.cmd, mams_channel)
     full_reminder = should_use_full_reminder(args.cmd, turn_index)
+    invoker_turn_index = invoker_collaborative_turn_index(args.cmd, config.mams_invoker)
+    invoker_full_reminder = should_use_full_reminder(args.cmd, invoker_turn_index)
 
     try:
         reply, updated_mams_channel = execute_command_for_mams_channel(
@@ -3550,16 +3580,18 @@ def main() -> int:
         eprint(str(exc))
         return 1
 
-    persist_mams_channels_for_command(repo_root, config, updated_mams_channel)
+    updated_config = persist_mams_channels_for_command(repo_root, config, updated_mams_channel)
+    updated_config = increment_mams_invoker_turn_count(updated_config, tool=args.cmd)
+    write_skill_config(repo_root, updated_config)
     if updated_mams_channel.runner == RUNNER_CODEX:
         try_promote_exec_session_to_cli(updated_mams_channel.session_id)
 
     sys.stdout.write(
         format_output_for_mams_invoker(
             repo_root,
-            config,
+            updated_config,
             tool=args.cmd,
-            full_reminder=full_reminder if args.cmd != "init" else True,
+            full_reminder=invoker_full_reminder if args.cmd != "init" else True,
             reply=reply,
             migration_notice=migration_notice,
         )
